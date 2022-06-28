@@ -147,6 +147,17 @@ type ReconcileStack struct {
 	recorder record.EventRecorder
 }
 
+func validateGitRepo(repo *pulumiv1.InlineGitRepo) error {
+	if repo == nil {
+		return errors.New("spec does not include .gitRepo")
+	}
+
+	if repo.Commit == "" && repo.Branch == "" {
+		return errors.New("Stack CustomResource needs to specify either 'branch' or 'commit' for the tracking repo.")
+	}
+	return nil
+}
+
 // Reconcile reads that state of the cluster for a Stack object and makes changes based on the state read
 // and what is in the Stack.Spec
 func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
@@ -178,32 +189,34 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 	sess := newReconcileStackSession(reqLogger, stack, r.client, request.Namespace)
 
 	// Ensure either branch or commit has been specified in the stack CR if stack is not marked for deletion
-	if !isStackMarkedToBeDeleted &&
-		sess.stack.Commit == "" &&
-		sess.stack.Branch == "" {
+	if !isStackMarkedToBeDeleted {
+		// Ensure either branch or commit has been specified in the stack CR
+		if err = validateGitRepo(sess.stack.GitRepo); err != nil {
+			r.emitEvent(instance, pulumiv1.StackConfigInvalidEvent(), err.Error())
+			reqLogger.Info(err.Error())
 
-		msg := "Stack CustomResource needs to specify either 'branch' or 'commit' for the tracking repo."
-		r.emitEvent(instance, pulumiv1.StackConfigInvalidEvent(), msg)
-		reqLogger.Info(msg)
-
-		return reconcile.Result{}, err
+			return reconcile.Result{}, err
+		}
 	}
 
+	// The GitRepo is assumed to be non-nil after validation
+	repo := stack.GitRepo
+
 	// Step 1. Set up the workdir, select the right stack and populate config if supplied.
-	gitAuth, err := sess.SetupGitAuth()
+	gitAuth, err := sess.SetupGitAuth(repo)
 	if err != nil {
 		r.emitEvent(instance, pulumiv1.StackGitAuthFailureEvent(), "Failed to setup git authentication: %v", err.Error())
 		reqLogger.Error(err, "Failed to setup git authentication", "Stack.Name", stack.Stack)
 		return reconcile.Result{}, err
 	}
 
-	if gitAuth.SSHPrivateKey != "" {
+	if gitAuth.SSHPrivateKey != "" { // TODO this should be in sess.SetupGitAuth()
 		// Add the project repo's public SSH keys to the SSH known hosts
 		// to perform the necessary key checking during SSH git cloning.
-		sess.addSSHKeysToKnownHosts(sess.stack.ProjectRepo)
+		sess.addSSHKeysToKnownHosts(repo.ProjectRepo)
 	}
 
-	if err = sess.SetupPulumiWorkdir(gitAuth); err != nil {
+	if err = sess.SetupPulumiWorkdir(repo, gitAuth); err != nil {
 		r.emitEvent(instance, pulumiv1.StackInitializationFailureEvent(), "Failed to initialize stack: %v", err.Error())
 		reqLogger.Error(err, "Failed to setup Pulumi workdir", "Stack.Name", stack.Stack)
 		return reconcile.Result{}, err
@@ -259,14 +272,14 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 	}
 
 	// If a branch is specified, then track changes to the branch.
-	trackBranch := len(sess.stack.Branch) > 0
+	trackBranch := len(repo.Branch) > 0
 
 	resyncFreqSeconds := sess.stack.ResyncFrequencySeconds
 	if sess.stack.ResyncFrequencySeconds != 0 && sess.stack.ResyncFrequencySeconds < 60 {
 		resyncFreqSeconds = 60
 	}
 
-	if trackBranch || sess.stack.ContinueResyncOnCommitMatch {
+	if trackBranch || repo.ContinueResyncOnCommitMatch {
 		if resyncFreqSeconds == 0 {
 			resyncFreqSeconds = 60
 		}
@@ -274,7 +287,7 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 
 	if trackBranch && instance.Status.LastUpdate != nil {
 		reqLogger.Info("Checking current HEAD commit hash", "Current commit", currentCommit)
-		if instance.Status.LastUpdate.LastSuccessfulCommit == currentCommit && !sess.stack.ContinueResyncOnCommitMatch {
+		if instance.Status.LastUpdate.LastSuccessfulCommit == currentCommit && !repo.ContinueResyncOnCommitMatch {
 			reqLogger.Info("Commit hash unchanged. Will poll again.", "pollFrequencySeconds", resyncFreqSeconds)
 			// Reconcile every resyncFreqSeconds to check for new commits to the branch.
 			return reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}, nil
@@ -373,7 +386,7 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 	}
 	reqLogger.Info("Successfully updated status for Stack", "Stack.Name", stack.Stack)
 	r.emitEvent(instance, pulumiv1.StackUpdateSuccessfulEvent(), "Successfully updated stack.")
-	if trackBranch || sess.stack.ContinueResyncOnCommitMatch {
+	if trackBranch || repo.ContinueResyncOnCommitMatch {
 		// Reconcile every 60 seconds to check for new commits to the branch.
 		reqLogger.Debug("Will requeue in", "seconds", resyncFreqSeconds)
 		return reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}, nil
@@ -468,7 +481,7 @@ func (sess *reconcileStackSession) addFinalizer(stack *pulumiv1.Stack) error {
 type reconcileStackSession struct {
 	logger     logging.Logger
 	kubeClient client.Client
-	stack      shared.StackSpec
+	stack      pulumiv1.StackSpec
 	autoStack  *auto.Stack
 	namespace  string
 	workdir    string
@@ -480,7 +493,7 @@ var _ shared.StackController = &reconcileStackSession{}
 
 func newReconcileStackSession(
 	logger logging.Logger,
-	stack shared.StackSpec,
+	stack pulumiv1.StackSpec,
 	kubeClient client.Client,
 	namespace string,
 ) *reconcileStackSession {
@@ -668,12 +681,12 @@ func (sess *reconcileStackSession) lookupPulumiAccessToken() (string, bool) {
 	return "", false
 }
 
-func (sess *reconcileStackSession) SetupPulumiWorkdir(gitAuth *auto.GitAuth) error {
+func (sess *reconcileStackSession) SetupPulumiWorkdir(srcRepo *pulumiv1.InlineGitRepo, gitAuth *auto.GitAuth) error {
 	repo := auto.GitRepo{
-		URL:         sess.stack.ProjectRepo,
-		ProjectPath: sess.stack.RepoDir,
-		CommitHash:  sess.stack.Commit,
-		Branch:      sess.stack.Branch,
+		URL:         srcRepo.ProjectRepo,
+		ProjectPath: sess.stack.RepoDir, // TODO should this be passed instead?
+		CommitHash:  srcRepo.Commit,
+		Branch:      srcRepo.Branch,
 		Auth:        gitAuth,
 	}
 
@@ -998,19 +1011,19 @@ func (sess *reconcileStackSession) DestroyStack() error {
 // repository of the stack. If neither gitAuth or gitAuthSecret are set,
 // a pointer to a zero value of GitAuth is returned — representing
 // unauthenticated git access.
-func (sess *reconcileStackSession) SetupGitAuth() (*auto.GitAuth, error) {
+func (sess *reconcileStackSession) SetupGitAuth(repo *pulumiv1.InlineGitRepo) (*auto.GitAuth, error) {
 	gitAuth := &auto.GitAuth{}
 
-	if sess.stack.GitAuth != nil {
-		if sess.stack.GitAuth.SSHAuth != nil {
-			privateKey, err := sess.resolveResourceRef(&sess.stack.GitAuth.SSHAuth.SSHPrivateKey)
+	if repo.GitAuth != nil {
+		if repo.GitAuth.SSHAuth != nil {
+			privateKey, err := sess.resolveResourceRef(&repo.GitAuth.SSHAuth.SSHPrivateKey)
 			if err != nil {
 				return nil, errors.Wrap(err, "resolving gitAuth SSH private key")
 			}
 			gitAuth.SSHPrivateKey = privateKey
 
-			if sess.stack.GitAuth.SSHAuth.Password != nil {
-				password, err := sess.resolveResourceRef(sess.stack.GitAuth.SSHAuth.Password)
+			if repo.GitAuth.SSHAuth.Password != nil {
+				password, err := sess.resolveResourceRef(repo.GitAuth.SSHAuth.Password)
 				if err != nil {
 					return nil, errors.Wrap(err, "resolving gitAuth SSH password")
 				}
@@ -1020,8 +1033,8 @@ func (sess *reconcileStackSession) SetupGitAuth() (*auto.GitAuth, error) {
 			return gitAuth, nil
 		}
 
-		if sess.stack.GitAuth.PersonalAccessToken != nil {
-			accessToken, err := sess.resolveResourceRef(sess.stack.GitAuth.PersonalAccessToken)
+		if repo.GitAuth.PersonalAccessToken != nil {
+			accessToken, err := sess.resolveResourceRef(repo.GitAuth.PersonalAccessToken)
 			if err != nil {
 				return nil, errors.Wrap(err, "resolving gitAuth personal access token")
 			}
@@ -1029,31 +1042,31 @@ func (sess *reconcileStackSession) SetupGitAuth() (*auto.GitAuth, error) {
 			return gitAuth, nil
 		}
 
-		if sess.stack.GitAuth.BasicAuth == nil {
+		if repo.GitAuth.BasicAuth == nil {
 			return nil, errors.New("gitAuth config must specify exactly one of " +
 				"'personalAccessToken', 'sshPrivateKey' or 'basicAuth'")
 		}
 
-		userName, err := sess.resolveResourceRef(&sess.stack.GitAuth.BasicAuth.UserName)
+		userName, err := sess.resolveResourceRef(&repo.GitAuth.BasicAuth.UserName)
 		if err != nil {
 			return nil, errors.Wrap(err, "resolving gitAuth username")
 		}
 
-		password, err := sess.resolveResourceRef(&sess.stack.GitAuth.BasicAuth.Password)
+		password, err := sess.resolveResourceRef(&repo.GitAuth.BasicAuth.Password)
 		if err != nil {
 			return nil, errors.Wrap(err, "resolving gitAuth password")
 		}
 
 		gitAuth.Username = userName
 		gitAuth.Password = password
-	} else if sess.stack.GitAuthSecret != "" {
-		namespacedName := types.NamespacedName{Name: sess.stack.GitAuthSecret, Namespace: sess.namespace}
+	} else if repo.GitAuthSecret != "" {
+		namespacedName := types.NamespacedName{Name: repo.GitAuthSecret, Namespace: sess.namespace}
 
 		// Fetch the named secret.
 		secret := &corev1.Secret{}
 		if err := sess.kubeClient.Get(context.TODO(), namespacedName, secret); err != nil {
 			sess.logger.Error(err, "Could not find secret for access to the git repository",
-				"Namespace", sess.namespace, "Stack.GitAuthSecret", sess.stack.GitAuthSecret)
+				"Namespace", sess.namespace, "Stack.GitAuthSecret", repo.GitAuthSecret)
 			return nil, err
 		}
 
