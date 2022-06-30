@@ -128,7 +128,8 @@ type StackSpec struct {
 
 type InlineGitRepo struct {
 	// ProjectRepo is the git source control repository from which we fetch the project code and configuration.
-	ProjectRepo string `json:"projectRepo"`
+	//+optional
+	ProjectRepo string `json:"projectRepo,omitempty"`
 	// (optional) GitAuthSecret is the the name of a secret containing an
 	// authentication option for the git repository.
 	// There are 3 different authentication options:
@@ -176,7 +177,7 @@ type SourceReference struct {
 }
 
 type InlineFluxSource struct {
-	SourceRef SourceReference `json:"sourceRef"`
+	SourceRef *SourceReference `json:"sourceRef,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

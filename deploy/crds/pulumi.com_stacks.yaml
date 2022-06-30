@@ -644,8 +644,6 @@ spec:
                   exist.
                 type: boolean
             required:
-            - projectRepo
-            - sourceRef
             - stack
             type: object
           status:

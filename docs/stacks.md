@@ -85,20 +85,6 @@ StackSpec defines the desired state of Pulumi Stack being managed by this operat
         </tr>
     </thead>
     <tbody><tr>
-        <td><b>projectRepo</b></td>
-        <td>string</td>
-        <td>
-          ProjectRepo is the git source control repository from which we fetch the project code and configuration.<br/>
-        </td>
-        <td>true</td>
-      </tr><tr>
-        <td><b><a href="#stackspecsourceref">sourceRef</a></b></td>
-        <td>object</td>
-        <td>
-          <br/>
-        </td>
-        <td>true</td>
-      </tr><tr>
         <td><b>stack</b></td>
         <td>string</td>
         <td>
@@ -197,6 +183,13 @@ StackSpec defines the desired state of Pulumi Stack being managed by this operat
         </td>
         <td>false</td>
       </tr><tr>
+        <td><b>projectRepo</b></td>
+        <td>string</td>
+        <td>
+          ProjectRepo is the git source control repository from which we fetch the project code and configuration.<br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
         <td><b>refresh</b></td>
         <td>boolean</td>
         <td>
@@ -248,53 +241,19 @@ StackSpec defines the desired state of Pulumi Stack being managed by this operat
         </td>
         <td>false</td>
       </tr><tr>
+        <td><b><a href="#stackspecsourceref">sourceRef</a></b></td>
+        <td>object</td>
+        <td>
+          <br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
         <td><b>useLocalStackOnly</b></td>
         <td>boolean</td>
         <td>
           (optional) UseLocalStackOnly can be set to true to prevent the operator from creating stacks that do not exist in the tracking git repo. The default behavior is to create a stack if it doesn't exist.<br/>
         </td>
         <td>false</td>
-      </tr></tbody>
-</table>
-
-
-### Stack.spec.sourceRef
-<sup><sup>[↩ Parent](#stackspec)</sup></sup>
-
-
-
-
-
-<table>
-    <thead>
-        <tr>
-            <th>Name</th>
-            <th>Type</th>
-            <th>Description</th>
-            <th>Required</th>
-        </tr>
-    </thead>
-    <tbody><tr>
-        <td><b>apiVersion</b></td>
-        <td>string</td>
-        <td>
-          The API version of the source; e.g., `source.toolkit.fluxcd.io/v1beta2`<br/>
-        </td>
-        <td>true</td>
-      </tr><tr>
-        <td><b>kind</b></td>
-        <td>string</td>
-        <td>
-          The Kind of the source; e.g., `GitRepository`<br/>
-        </td>
-        <td>true</td>
-      </tr><tr>
-        <td><b>name</b></td>
-        <td>string</td>
-        <td>
-          The name of the source.<br/>
-        </td>
-        <td>true</td>
       </tr></tbody>
 </table>
 
@@ -1643,6 +1602,47 @@ SecretRef refers to a Kubernetes secret
           Namespace where the secret is stored. Defaults to 'default' if omitted.<br/>
         </td>
         <td>false</td>
+      </tr></tbody>
+</table>
+
+
+### Stack.spec.sourceRef
+<sup><sup>[↩ Parent](#stackspec)</sup></sup>
+
+
+
+
+
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Description</th>
+            <th>Required</th>
+        </tr>
+    </thead>
+    <tbody><tr>
+        <td><b>apiVersion</b></td>
+        <td>string</td>
+        <td>
+          The API version of the source; e.g., `source.toolkit.fluxcd.io/v1beta2`<br/>
+        </td>
+        <td>true</td>
+      </tr><tr>
+        <td><b>kind</b></td>
+        <td>string</td>
+        <td>
+          The Kind of the source; e.g., `GitRepository`<br/>
+        </td>
+        <td>true</td>
+      </tr><tr>
+        <td><b>name</b></td>
+        <td>string</td>
+        <td>
+          The name of the source.<br/>
+        </td>
+        <td>true</td>
       </tr></tbody>
 </table>
 
