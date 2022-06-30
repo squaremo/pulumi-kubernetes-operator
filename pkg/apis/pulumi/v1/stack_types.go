@@ -85,8 +85,9 @@ type StackSpec struct {
 	// See: https://www.pulumi.com/docs/intro/concepts/secrets/#initializing-a-stack-with-alternative-encryption
 	SecretsProvider string `json:"secretsProvider,omitempty"`
 
-	// Source control:
-	GitRepo *InlineGitRepo `json:",inline,omitempty"`
+	// Source control: either GitRepo or FluxSource fields should be populated.
+	GitRepo    *InlineGitRepo    `json:",inline,omitempty"`
+	FluxSource *InlineFluxSource `json:",inline,omitempty"`
 
 	// (optional) RepoDir is the directory to work from in the project's source repository
 	// where Pulumi.yaml is located. It is used in case Pulumi.yaml is not
@@ -163,6 +164,19 @@ type InlineGitRepo struct {
 	// Defaults to false, i.e. when a particular commit is successfully run, the operator will not attempt to rerun the
 	// program at that commit again.
 	ContinueResyncOnCommitMatch bool `json:"continueResyncOnCommitMatch,omitempty"`
+}
+
+type SourceReference struct {
+	// The API version of the source; e.g., `source.toolkit.fluxcd.io/v1beta2`
+	APIVersion string `json:"apiVersion"`
+	// The Kind of the source; e.g., `GitRepository`
+	Kind string `json:"kind"`
+	// The name of the source.
+	Name string `json:"name"`
+}
+
+type InlineFluxSource struct {
+	SourceRef SourceReference `json:"sourceRef"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

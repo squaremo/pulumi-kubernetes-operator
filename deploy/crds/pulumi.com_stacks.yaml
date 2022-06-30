@@ -617,6 +617,22 @@ spec:
                   omitted, secrets configuration is assumed to be checked in and taken
                   from the source repository.
                 type: object
+              sourceRef:
+                properties:
+                  apiVersion:
+                    description: The API version of the source; e.g., `source.toolkit.fluxcd.io/v1beta2`
+                    type: string
+                  kind:
+                    description: The Kind of the source; e.g., `GitRepository`
+                    type: string
+                  name:
+                    description: The name of the source.
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                type: object
               stack:
                 description: Stack is the fully qualified name of the stack to deploy
                   (<org>/<stack>).
@@ -629,6 +645,7 @@ spec:
                 type: boolean
             required:
             - projectRepo
+            - sourceRef
             - stack
             type: object
           status:
