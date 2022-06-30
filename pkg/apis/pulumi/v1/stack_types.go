@@ -86,8 +86,8 @@ type StackSpec struct {
 	SecretsProvider string `json:"secretsProvider,omitempty"`
 
 	// Source control: either GitRepo or FluxSource fields should be populated.
-	GitRepo    *InlineGitRepo    `json:",inline,omitempty"`
-	FluxSource *InlineFluxSource `json:",inline,omitempty"`
+	GitRepo   *InlineGitRepo   `json:",inline,omitempty"`
+	SourceRef *SourceReference `json:"sourceRef,omitempty"`
 
 	// (optional) RepoDir is the directory to work from in the project's source repository
 	// where Pulumi.yaml is located. It is used in case Pulumi.yaml is not
@@ -174,10 +174,6 @@ type SourceReference struct {
 	Kind string `json:"kind"`
 	// The name of the source.
 	Name string `json:"name"`
-}
-
-type InlineFluxSource struct {
-	SourceRef *SourceReference `json:"sourceRef,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
