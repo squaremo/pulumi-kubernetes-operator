@@ -86,7 +86,7 @@ type StackSpec struct {
 	SecretsProvider string `json:"secretsProvider,omitempty"`
 
 	// Source control: either GitRepo or FluxSource fields should be populated.
-	GitRepo   *InlineGitRepo   `json:",inline,omitempty"`
+	GitRepo   *InlineGitRepo   `json:"gitRepo,omitempty"`
 	SourceRef *SourceReference `json:"sourceRef,omitempty"`
 
 	// (optional) RepoDir is the directory to work from in the project's source repository
