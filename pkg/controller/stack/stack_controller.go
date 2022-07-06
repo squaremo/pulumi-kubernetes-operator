@@ -194,6 +194,12 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 	// Create a new reconciliation session.
 	sess := newReconcileStackSession(reqLogger, stack, r.client, request.Namespace)
 
+	// These are the bits needed from setting up the workspace
+	var workspace auto.Workspace
+	var currentCommit string
+
+	// Step 1. Set up the workdir, select the right stack and populate config if supplied.
+
 	repo, source := stack.GitRepo, stack.SourceRef
 	switch {
 	case repo != nil && source == nil:
@@ -208,7 +214,6 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 			}
 		}
 
-		// Step 1. Set up the workdir, select the right stack and populate config if supplied.
 		gitAuth, err := sess.SetupGitAuth(repo)
 		if err != nil {
 			r.emitEvent(instance, pulumiv1.StackGitAuthFailureEvent(), "Failed to setup git authentication: %v", err.Error())
@@ -222,180 +227,11 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 			sess.addSSHKeysToKnownHosts(repo.ProjectRepo)
 		}
 
-		if err = sess.SetupWorkdirWithGitRepo(repo, gitAuth); err != nil {
+		workspace, currentCommit, err = sess.SetupWorkdirWithGitRepo(repo, gitAuth)
+		if err != nil {
 			r.emitEvent(instance, pulumiv1.StackInitializationFailureEvent(), "Failed to initialize stack: %v", err.Error())
 			reqLogger.Error(err, "Failed to setup Pulumi workdir", "Stack.Name", stack.Stack)
 			return reconcile.Result{}, err
-		}
-
-		// Delete the temporary directory after the reconciliation is completed (regardless of success or failure).
-		defer sess.CleanupPulumiDir()
-
-		currentCommit, err := revisionAtWorkingDir(sess.workdir)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Step 2. If there are extra environment variables, read them in now and use them for subsequent commands.
-		if err = sess.SetEnvs(stack.Envs, request.Namespace); err != nil {
-			if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find ConfigMap for Envs"), currentCommit, ""); err2 != nil {
-				return reconcile.Result{}, err2
-			}
-			return reconcile.Result{}, err
-		}
-		if err = sess.SetSecretEnvs(stack.SecretEnvs, request.Namespace); err != nil {
-			if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find Secret for SecretEnvs"),
-				currentCommit, ""); err2 != nil {
-				return reconcile.Result{}, err2
-			}
-			return reconcile.Result{}, err
-		}
-
-		// Check if the Stack instance is marked to be deleted, which is
-		// indicated by the deletion timestamp being set.
-		isStackMarkedToBeDeleted = instance.GetDeletionTimestamp() != nil
-
-		// Finalize the stack, or add a finalizer based on the deletion timestamp.
-		if isStackMarkedToBeDeleted {
-			if contains(instance.GetFinalizers(), pulumiFinalizer) {
-				err := sess.finalize(instance)
-				// Manage extra status here
-				return reconcile.Result{}, err
-			}
-		} else {
-			if !contains(instance.GetFinalizers(), pulumiFinalizer) {
-				// Add finalizer to Stack if not being deleted
-				err := sess.addFinalizer(instance)
-				if err != nil {
-					return reconcile.Result{}, err
-				}
-				time.Sleep(2 * time.Second) // arbitrary sleep after finalizer add to avoid stale obj for permalink
-				// Add default permalink for the stack in the Pulumi Service.
-				if err := sess.addDefaultPermalink(instance); err != nil {
-					return reconcile.Result{}, err
-				}
-			}
-		}
-
-		// If a branch is specified, then track changes to the branch.
-		trackBranch := len(repo.Branch) > 0
-
-		resyncFreqSeconds := sess.stack.ResyncFrequencySeconds
-		if sess.stack.ResyncFrequencySeconds != 0 && sess.stack.ResyncFrequencySeconds < 60 {
-			resyncFreqSeconds = 60
-		}
-
-		if trackBranch || repo.ContinueResyncOnCommitMatch {
-			if resyncFreqSeconds == 0 {
-				resyncFreqSeconds = 60
-			}
-		}
-
-		if trackBranch && instance.Status.LastUpdate != nil {
-			reqLogger.Info("Checking current HEAD commit hash", "Current commit", currentCommit)
-			if instance.Status.LastUpdate.LastSuccessfulCommit == currentCommit && !repo.ContinueResyncOnCommitMatch {
-				reqLogger.Info("Commit hash unchanged. Will poll again.", "pollFrequencySeconds", resyncFreqSeconds)
-				// Reconcile every resyncFreqSeconds to check for new commits to the branch.
-				return reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}, nil
-			}
-
-			if instance.Status.LastUpdate.LastSuccessfulCommit != currentCommit {
-				r.emitEvent(instance, pulumiv1.StackUpdateDetectedEvent(), "New commit detected: %q.", currentCommit)
-				reqLogger.Info("New commit hash found", "Current commit", currentCommit,
-					"Last commit", instance.Status.LastUpdate.LastSuccessfulCommit)
-			}
-		}
-
-		// Step 3. If a stack refresh is requested, run it now.
-		if sess.stack.Refresh {
-			permalink, err := sess.RefreshStack(sess.stack.ExpectNoRefreshChanges)
-			if err != nil {
-				if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "refreshing stack"), currentCommit, permalink); err2 != nil {
-					return reconcile.Result{}, err2
-				}
-				return reconcile.Result{}, err
-			}
-			err = sess.getLatestResource(instance, request.NamespacedName)
-			if err != nil {
-				sess.logger.Error(err, "Failed to get latest Stack to update refresh status", "Stack.Name", instance.Spec.Stack)
-				return reconcile.Result{}, err
-			}
-			if instance.Status.LastUpdate == nil {
-				instance.Status.LastUpdate = &shared.StackUpdateState{}
-			}
-			instance.Status.LastUpdate.Permalink = permalink
-
-			err = sess.updateResourceStatus(instance)
-			if err != nil {
-				reqLogger.Error(err, "Failed to update Stack status for refresh", "Stack.Name", stack.Stack)
-				return reconcile.Result{}, err
-			}
-			reqLogger.Info("Successfully refreshed Stack", "Stack.Name", stack.Stack)
-		}
-
-		// Step 4. Run a `pulumi up --skip-preview`.
-		// TODO: is it possible to support a --dry-run with a preview?
-		status, permalink, result, err := sess.UpdateStack()
-		switch status {
-		case shared.StackUpdateConflict:
-			r.emitEvent(instance,
-				pulumiv1.StackUpdateConflictDetectedEvent(),
-				"Conflict with another concurrent update. "+
-					"If Stack CR specifies 'retryOnUpdateConflict' a retry will trigger automatically.")
-			if sess.stack.RetryOnUpdateConflict {
-				reqLogger.Error(err, "Conflict with another concurrent update -- will retry shortly", "Stack.Name", stack.Stack)
-				return reconcile.Result{RequeueAfter: time.Second * 5}, nil
-			}
-			reqLogger.Error(err, "Conflict with another concurrent update -- NOT retrying", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, nil
-		case shared.StackNotFound:
-			r.emitEvent(instance, pulumiv1.StackNotFoundEvent(), "Stack not found. Will retry.")
-			reqLogger.Error(err, "Stack not found -- will retry shortly", "Stack.Name", stack.Stack, "Err:")
-			return reconcile.Result{RequeueAfter: time.Second * 5}, nil
-		default:
-			if err != nil {
-				if err2 := r.markStackFailed(sess, instance, err, currentCommit, permalink); err2 != nil {
-					return reconcile.Result{}, err2
-				}
-				return reconcile.Result{}, err
-			}
-		}
-
-		// Step 5. Capture outputs onto the resulting status object.
-		outs, err := sess.GetStackOutputs(result.Outputs)
-		if err != nil {
-			r.emitEvent(instance, pulumiv1.StackOutputRetrievalFailureEvent(), "Failed to get Stack outputs: %v.", err.Error())
-			reqLogger.Error(err, "Failed to get Stack outputs", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, err
-		}
-		if outs == nil {
-			reqLogger.Info("Stack outputs are empty. Skipping status update", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, nil
-		}
-		err = sess.getLatestResource(instance, request.NamespacedName)
-		if err != nil {
-			sess.logger.Error(err, "Failed to get latest Stack to update successful Stack status", "Stack.Name", instance.Spec.Stack)
-			return reconcile.Result{}, err
-		}
-		instance.Status.Outputs = outs
-		instance.Status.LastUpdate = &shared.StackUpdateState{
-			State:                shared.SucceededStackStateMessage,
-			LastAttemptedCommit:  currentCommit,
-			LastSuccessfulCommit: currentCommit,
-			Permalink:            permalink,
-			LastResyncTime:       metav1.Now(),
-		}
-		err = sess.updateResourceStatus(instance)
-		if err != nil {
-			reqLogger.Error(err, "Failed to update Stack status", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, err
-		}
-		reqLogger.Info("Successfully updated status for Stack", "Stack.Name", stack.Stack)
-		r.emitEvent(instance, pulumiv1.StackUpdateSuccessfulEvent(), "Successfully updated stack.")
-		if trackBranch || repo.ContinueResyncOnCommitMatch {
-			// Reconcile every 60 seconds to check for new commits to the branch.
-			reqLogger.Debug("Will requeue in", "seconds", resyncFreqSeconds)
-			return reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}, nil
 		}
 
 	case source != nil && repo == nil:
@@ -411,58 +247,79 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 			return reconcile.Result{}, fmt.Errorf("could not resolve sourceRef: %w", err)
 		}
 
-		if err := sess.SetupWorkDirWithSource(ctx, sourceObject); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Delete the temporary directory after the reconciliation is completed (regardless of success or failure).
-		defer sess.CleanupPulumiDir()
-
-		currentCommit, err := revisionAtWorkingDir(sess.workdir)
+		workspace, currentCommit, err = sess.SetupWorkDirWithSource(ctx, sourceObject)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 
-		// Step 2. If there are extra environment variables, read them in now and use them for subsequent commands.
-		if err = sess.SetEnvs(stack.Envs, request.Namespace); err != nil {
-			if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find ConfigMap for Envs"), currentCommit, ""); err2 != nil {
-				return reconcile.Result{}, err2
-			}
+	default:
+		// TODO event, and failure in status
+		// FIXME: this may be confusing if it's one of the other inline fields that got populated,
+		// making gitRepo non-nil. Might just have to grit teeth and make a backward-incompatible
+		// change (or implement a webhook), by nesting the git repo details rather than inlining
+		// them.
+		return reconcile.Result{}, errors.New("exactly one of .spec.projectRepo and .spec.sourceRef should be supplied")
+	}
+
+	// Delete the temporary directory after the reconciliation is completed (regardless of success or failure).
+	defer sess.CleanupPulumiDir()
+
+	// Step 1 continued: Create a stack from the workspace
+	if err = sess.ensureStack(ctx, workspace); err != nil {
+		// TODO: consider events and status
+		return reconcile.Result{}, err
+	}
+
+	// Step 2. If there are extra environment variables, read them in now and use them for subsequent commands.
+	if err = sess.SetEnvs(stack.Envs, request.Namespace); err != nil {
+		if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find ConfigMap for Envs"), currentCommit, ""); err2 != nil {
+			return reconcile.Result{}, err2
+		}
+		return reconcile.Result{}, err
+	}
+	if err = sess.SetSecretEnvs(stack.SecretEnvs, request.Namespace); err != nil {
+		if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find Secret for SecretEnvs"),
+			currentCommit, ""); err2 != nil {
+			return reconcile.Result{}, err2
+		}
+		return reconcile.Result{}, err
+	}
+
+	// Check if the Stack instance is marked to be deleted, which is
+	// indicated by the deletion timestamp being set.
+	isStackMarkedToBeDeleted = instance.GetDeletionTimestamp() != nil
+
+	// Finalize the stack, or add a finalizer based on the deletion timestamp.  This happens here
+	// (rather than right up front) because the project directory is needed to be able to delete the
+	// stack, which is what needs to be cleaned up.
+	if isStackMarkedToBeDeleted {
+		if contains(instance.GetFinalizers(), pulumiFinalizer) {
+			err := sess.finalize(instance)
+			// Manage extra status here
 			return reconcile.Result{}, err
 		}
-		if err = sess.SetSecretEnvs(stack.SecretEnvs, request.Namespace); err != nil {
-			if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "could not find Secret for SecretEnvs"),
-				currentCommit, ""); err2 != nil {
-				return reconcile.Result{}, err2
-			}
-			return reconcile.Result{}, err
-		}
-
-		// Check if the Stack instance is marked to be deleted, which is
-		// indicated by the deletion timestamp being set.
-		isStackMarkedToBeDeleted = instance.GetDeletionTimestamp() != nil
-
-		// Finalize the stack, or add a finalizer based on the deletion timestamp.
-		if isStackMarkedToBeDeleted {
-			if contains(instance.GetFinalizers(), pulumiFinalizer) {
-				err := sess.finalize(instance)
-				// Manage extra status here
+	} else {
+		if !contains(instance.GetFinalizers(), pulumiFinalizer) {
+			// Add finalizer to Stack if not being deleted
+			err := sess.addFinalizer(instance)
+			if err != nil {
 				return reconcile.Result{}, err
 			}
-		} else {
-			if !contains(instance.GetFinalizers(), pulumiFinalizer) {
-				// Add finalizer to Stack if not being deleted
-				err := sess.addFinalizer(instance)
-				if err != nil {
-					return reconcile.Result{}, err
-				}
-				time.Sleep(2 * time.Second) // arbitrary sleep after finalizer add to avoid stale obj for permalink
-				// Add default permalink for the stack in the Pulumi Service.
-				if err := sess.addDefaultPermalink(instance); err != nil {
-					return reconcile.Result{}, err
-				}
+			time.Sleep(2 * time.Second) // arbitrary sleep after finalizer add to avoid stale obj for permalink
+			// Add default permalink for the stack in the Pulumi Service.
+			if err := sess.addDefaultPermalink(instance); err != nil {
+				return reconcile.Result{}, err
 			}
 		}
+	}
+
+	// After here, it's possible that we'll want to reschedule even on success. This keeps track of
+	// the result to return to controller-runtime if everything goes well.
+	var successResult reconcile.Result
+
+	// TODO This is specific to inline git repo, and could reasonably go e.g., in the case block;
+	// leave it here for now, so I don't have to think about how it interacts with deletion handling.
+	if repo != nil {
 
 		// If a branch is specified, then track changes to the branch.
 		trackBranch := len(repo.Branch) > 0
@@ -493,103 +350,102 @@ func (r *ReconcileStack) Reconcile(ctx context.Context, request reconcile.Reques
 			}
 		}
 
-		// Step 3. If a stack refresh is requested, run it now.
-		if sess.stack.Refresh {
-			permalink, err := sess.RefreshStack(sess.stack.ExpectNoRefreshChanges)
-			if err != nil {
-				if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "refreshing stack"), currentCommit, permalink); err2 != nil {
-					return reconcile.Result{}, err2
-				}
-				return reconcile.Result{}, err
-			}
-			err = sess.getLatestResource(instance, request.NamespacedName)
-			if err != nil {
-				sess.logger.Error(err, "Failed to get latest Stack to update refresh status", "Stack.Name", instance.Spec.Stack)
-				return reconcile.Result{}, err
-			}
-			if instance.Status.LastUpdate == nil {
-				instance.Status.LastUpdate = &shared.StackUpdateState{}
-			}
-			instance.Status.LastUpdate.Permalink = permalink
-
-			err = sess.updateResourceStatus(instance)
-			if err != nil {
-				reqLogger.Error(err, "Failed to update Stack status for refresh", "Stack.Name", stack.Stack)
-				return reconcile.Result{}, err
-			}
-			reqLogger.Info("Successfully refreshed Stack", "Stack.Name", stack.Stack)
-		}
-
-		// Step 4. Run a `pulumi up --skip-preview`.
-		// TODO: is it possible to support a --dry-run with a preview?
-		status, permalink, result, err := sess.UpdateStack()
-		switch status {
-		case shared.StackUpdateConflict:
-			r.emitEvent(instance,
-				pulumiv1.StackUpdateConflictDetectedEvent(),
-				"Conflict with another concurrent update. "+
-					"If Stack CR specifies 'retryOnUpdateConflict' a retry will trigger automatically.")
-			if sess.stack.RetryOnUpdateConflict {
-				reqLogger.Error(err, "Conflict with another concurrent update -- will retry shortly", "Stack.Name", stack.Stack)
-				return reconcile.Result{RequeueAfter: time.Second * 5}, nil
-			}
-			reqLogger.Error(err, "Conflict with another concurrent update -- NOT retrying", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, nil
-		case shared.StackNotFound:
-			r.emitEvent(instance, pulumiv1.StackNotFoundEvent(), "Stack not found. Will retry.")
-			reqLogger.Error(err, "Stack not found -- will retry shortly", "Stack.Name", stack.Stack, "Err:")
-			return reconcile.Result{RequeueAfter: time.Second * 5}, nil
-		default:
-			if err != nil {
-				if err2 := r.markStackFailed(sess, instance, err, currentCommit, permalink); err2 != nil {
-					return reconcile.Result{}, err2
-				}
-				return reconcile.Result{}, err
-			}
-		}
-
-		// Step 5. Capture outputs onto the resulting status object.
-		outs, err := sess.GetStackOutputs(result.Outputs)
-		if err != nil {
-			r.emitEvent(instance, pulumiv1.StackOutputRetrievalFailureEvent(), "Failed to get Stack outputs: %v.", err.Error())
-			reqLogger.Error(err, "Failed to get Stack outputs", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, err
-		}
-		if outs == nil {
-			reqLogger.Info("Stack outputs are empty. Skipping status update", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, nil
-		}
-		err = sess.getLatestResource(instance, request.NamespacedName)
-		if err != nil {
-			sess.logger.Error(err, "Failed to get latest Stack to update successful Stack status", "Stack.Name", instance.Spec.Stack)
-			return reconcile.Result{}, err
-		}
-		instance.Status.Outputs = outs
-		instance.Status.LastUpdate = &shared.StackUpdateState{
-			State:                shared.SucceededStackStateMessage,
-			LastAttemptedCommit:  currentCommit,
-			LastSuccessfulCommit: currentCommit,
-			Permalink:            permalink,
-			LastResyncTime:       metav1.Now(),
-		}
-		err = sess.updateResourceStatus(instance)
-		if err != nil {
-			reqLogger.Error(err, "Failed to update Stack status", "Stack.Name", stack.Stack)
-			return reconcile.Result{}, err
-		}
-		reqLogger.Info("Successfully updated status for Stack", "Stack.Name", stack.Stack)
-		r.emitEvent(instance, pulumiv1.StackUpdateSuccessfulEvent(), "Successfully updated stack.")
+		// No returning early, but still want to schedule another git poll.
 		if trackBranch || repo.ContinueResyncOnCommitMatch {
 			// Reconcile every 60 seconds to check for new commits to the branch.
 			reqLogger.Debug("Will requeue in", "seconds", resyncFreqSeconds)
-			return reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}, nil
+			successResult = reconcile.Result{RequeueAfter: time.Duration(resyncFreqSeconds) * time.Second}
 		}
-	default:
-		// TODO event, and failure in status
-		return reconcile.Result{}, errors.New("exactly one of .spec.gitRepo and .spec.sourceRef should be supplied")
 	}
 
-	return reconcile.Result{}, nil
+	// Step 3. If a stack refresh is requested, run it now.
+	if sess.stack.Refresh {
+		permalink, err := sess.RefreshStack(sess.stack.ExpectNoRefreshChanges)
+		if err != nil {
+			if err2 := r.markStackFailed(sess, instance, errors.Wrap(err, "refreshing stack"), currentCommit, permalink); err2 != nil {
+				return reconcile.Result{}, err2
+			}
+			return reconcile.Result{}, err
+		}
+		err = sess.getLatestResource(instance, request.NamespacedName)
+		if err != nil {
+			sess.logger.Error(err, "Failed to get latest Stack to update refresh status", "Stack.Name", instance.Spec.Stack)
+			return reconcile.Result{}, err
+		}
+		if instance.Status.LastUpdate == nil {
+			instance.Status.LastUpdate = &shared.StackUpdateState{}
+		}
+		instance.Status.LastUpdate.Permalink = permalink
+
+		err = sess.updateResourceStatus(instance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Stack status for refresh", "Stack.Name", stack.Stack)
+			return reconcile.Result{}, err
+		}
+		reqLogger.Info("Successfully refreshed Stack", "Stack.Name", stack.Stack)
+	}
+
+	// Step 4. Run a `pulumi up --skip-preview`.
+	// TODO: is it possible to support a --dry-run with a preview?
+	status, permalink, result, err := sess.UpdateStack()
+	switch status {
+	case shared.StackUpdateConflict:
+		r.emitEvent(instance,
+			pulumiv1.StackUpdateConflictDetectedEvent(),
+			"Conflict with another concurrent update. "+
+				"If Stack CR specifies 'retryOnUpdateConflict' a retry will trigger automatically.")
+		if sess.stack.RetryOnUpdateConflict {
+			reqLogger.Error(err, "Conflict with another concurrent update -- will retry shortly", "Stack.Name", stack.Stack)
+			return reconcile.Result{RequeueAfter: time.Second * 5}, nil
+		}
+		reqLogger.Error(err, "Conflict with another concurrent update -- NOT retrying", "Stack.Name", stack.Stack)
+		return reconcile.Result{}, nil
+	case shared.StackNotFound:
+		r.emitEvent(instance, pulumiv1.StackNotFoundEvent(), "Stack not found. Will retry.")
+		reqLogger.Error(err, "Stack not found -- will retry shortly", "Stack.Name", stack.Stack, "Err:")
+		return reconcile.Result{RequeueAfter: time.Second * 5}, nil
+	default:
+		if err != nil {
+			if err2 := r.markStackFailed(sess, instance, err, currentCommit, permalink); err2 != nil {
+				return reconcile.Result{}, err2
+			}
+			return reconcile.Result{}, err
+		}
+	}
+
+	// Step 5. Capture outputs onto the resulting status object.
+	outs, err := sess.GetStackOutputs(result.Outputs)
+	if err != nil {
+		r.emitEvent(instance, pulumiv1.StackOutputRetrievalFailureEvent(), "Failed to get Stack outputs: %v.", err.Error())
+		reqLogger.Error(err, "Failed to get Stack outputs", "Stack.Name", stack.Stack)
+		return reconcile.Result{}, err
+	}
+	if outs == nil {
+		reqLogger.Info("Stack outputs are empty. Skipping status update", "Stack.Name", stack.Stack)
+		return reconcile.Result{}, nil
+	}
+	err = sess.getLatestResource(instance, request.NamespacedName)
+	if err != nil {
+		sess.logger.Error(err, "Failed to get latest Stack to update successful Stack status", "Stack.Name", instance.Spec.Stack)
+		return reconcile.Result{}, err
+	}
+	instance.Status.Outputs = outs
+	instance.Status.LastUpdate = &shared.StackUpdateState{
+		State:                shared.SucceededStackStateMessage,
+		LastAttemptedCommit:  currentCommit,
+		LastSuccessfulCommit: currentCommit,
+		Permalink:            permalink,
+		LastResyncTime:       metav1.Now(),
+	}
+	err = sess.updateResourceStatus(instance)
+	if err != nil {
+		reqLogger.Error(err, "Failed to update Stack status", "Stack.Name", stack.Stack)
+		return reconcile.Result{}, err
+	}
+	reqLogger.Info("Successfully updated status for Stack", "Stack.Name", stack.Stack)
+	r.emitEvent(instance, pulumiv1.StackUpdateSuccessfulEvent(), "Successfully updated stack.")
+
+	return successResult, nil
 }
 
 func (r *ReconcileStack) emitEvent(instance *pulumiv1.Stack, event pulumiv1.StackEvent, messageFmt string, args ...interface{}) {
@@ -878,10 +734,10 @@ func (sess *reconcileStackSession) lookupPulumiAccessToken() (string, bool) {
 	return "", false
 }
 
-func (sess *reconcileStackSession) SetupWorkDirWithSource(ctx context.Context, source unstructured.Unstructured) (retErr error) {
+func (sess *reconcileStackSession) SetupWorkDirWithSource(ctx context.Context, source unstructured.Unstructured) (_ auto.Workspace, _ string, retErr error) {
 	rootdir, err := os.MkdirTemp("", "pulumi_source")
 	if err != nil {
-		return errors.Wrap(err, "unable to create tmp directory for workspace")
+		return nil, "", errors.Wrap(err, "unable to create tmp directory for workspace")
 	}
 	sess.rootDir = rootdir
 
@@ -891,32 +747,33 @@ func (sess *reconcileStackSession) SetupWorkDirWithSource(ctx context.Context, s
 		}
 	}()
 
-	// this is based closely on https://github.com/fluxcd/kustomize-controller/blob/db3c321163522259595894ca6c19ed44a876976d/controllers/kustomization_controller.go#L529
+	// this source artifact fetching code is based closely on
+	// https://github.com/fluxcd/kustomize-controller/blob/db3c321163522259595894ca6c19ed44a876976d/controllers/kustomization_controller.go#L529
 	artifactURL, ok, err := unstructured.NestedString(source.Object, "status", "artifact", "url")
 	if !ok || err != nil {
-		return errors.New("expected source to have .status.artifact.url, but it did not")
+		return nil, "", errors.New("expected source to have .status.artifact.url, but it did not")
 	}
 
 	revision, ok, err := unstructured.NestedString(source.Object, "status", "artifact", "revision")
 	if !ok || err != nil {
-		return errors.New("did not find revision in .status.artifact")
+		return nil, "", errors.New("did not find revision in .status.artifact")
 	}
 
 	checksum, ok, err := unstructured.NestedString(source.Object, "status", "artifact", "checksum")
 	if !ok || err != nil {
-		return errors.New("did not find revision in .status.artifact")
+		return nil, "", errors.New("did not find revision in .status.artifact")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, artifactURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create a request: %w", err)
+		return nil, "", fmt.Errorf("failed to create a request: %w", err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request for artifact failed: %w", err)
+		return nil, "", fmt.Errorf("request for artifact failed: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to download artifact from %s, status %q (expected 200 OK)", artifactURL, resp.Status)
+		return nil, "", fmt.Errorf("failed to download artifact from %s, status %q (expected 200 OK)", artifactURL, resp.Status)
 	}
 	// TODO validate size, if given
 
@@ -929,25 +786,40 @@ func (sess *reconcileStackSession) SetupWorkDirWithSource(ctx context.Context, s
 	}
 	out := io.MultiWriter(hasher, &buf)
 	if _, err := io.Copy(out, resp.Body); err != nil {
-		return fmt.Errorf("failed to compute checksum from artifact response: %w", err)
+		return nil, "", fmt.Errorf("failed to compute checksum from artifact response: %w", err)
 	}
 	if checksum1 := fmt.Sprintf("%x", hasher.Sum(nil)); checksum1 != checksum {
-		return fmt.Errorf("computed checksum of artifact %q does not match checksum recorded %q", checksum1, checksum)
+		return nil, "", fmt.Errorf("computed checksum of artifact %q does not match checksum recorded %q", checksum1, checksum)
 	}
 
 	// we downloaded the artifact gzip-tarball into a buffer and it matches the checksum; untar it into our working dir
 	if err = untar(&buf, rootdir); err != nil {
-		return fmt.Errorf("failed to extract archive tarball: %w", err)
+		return nil, "", fmt.Errorf("failed to extract archive tarball: %w", err)
 	}
 
-	//secretsProvider := auto.SecretsProvider(sess.stack.SecretsProvider)
+	// woo! now there's a directory with source in `rootdir`. Construct a workspace.
 
-	fmt.Printf("Got artifact from %q at revision %q\n", artifactURL, revision)
-	return errors.New("not fully implemented")
+	secretsProvider := auto.SecretsProvider(sess.stack.SecretsProvider)
+	w, err := auto.NewLocalWorkspace(ctx, auto.WorkDir(filepath.Join(rootdir, sess.stack.RepoDir)), secretsProvider)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "failed to create local workspace")
+	}
+
+	// fill in some blanks
+	sess.workdir = w.WorkDir()
+	if sess.stack.Backend != "" {
+		w.SetEnvVar("PULUMI_BACKEND_URL", sess.stack.Backend)
+	}
+	if accessToken, found := sess.lookupPulumiAccessToken(); found {
+		w.SetEnvVar("PULUMI_ACCESS_TOKEN", accessToken)
+	}
+	if err = sess.SetEnvRefsForWorkspace(w); err != nil {
+		return nil, "", err
+	}
 
 	// do the automation API bit
 
-	return nil
+	return w, revision, nil
 }
 
 // This procedure is adapted minorly from golang.org/x/build/internal/untar. Here is the original
@@ -1061,7 +933,7 @@ func untar(r io.Reader, dir string) error {
 	return nil
 }
 
-func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.InlineGitRepo, gitAuth *auto.GitAuth) error {
+func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.InlineGitRepo, gitAuth *auto.GitAuth) (_ auto.Workspace, _ string, retErr error) {
 	repo := auto.GitRepo{
 		URL:         srcRepo.ProjectRepo,
 		ProjectPath: sess.stack.RepoDir, // TODO should this be passed instead?
@@ -1077,13 +949,13 @@ func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.Inl
 	// Create the temporary workdir
 	dir, err := os.MkdirTemp("", "pulumi_auto")
 	if err != nil {
-		return errors.Wrap(err, "unable to create tmp directory for workspace")
+		return nil, "", errors.Wrap(err, "unable to create tmp directory for workspace")
 	}
 	sess.rootDir = dir
 
 	// Cleanup the rootdir on failure setting up the workspace.
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			_ = os.RemoveAll(sess.rootDir)
 		}
 	}()
@@ -1091,7 +963,7 @@ func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.Inl
 	var w auto.Workspace
 	w, err = auto.NewLocalWorkspace(context.Background(), auto.WorkDir(dir), auto.Repo(repo), secretsProvider)
 	if err != nil {
-		return errors.Wrap(err, "failed to create local workspace")
+		return nil, "", errors.Wrap(err, "failed to create local workspace")
 	}
 
 	sess.workdir = w.WorkDir()
@@ -1104,18 +976,27 @@ func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.Inl
 	}
 
 	if err = sess.SetEnvRefsForWorkspace(w); err != nil {
-		return err
+		return nil, "", err
 	}
 
-	ctx := context.Background()
+	currentCommit, err := revisionAtWorkingDir(sess.workdir)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return w, currentCommit, nil
+}
+
+func (sess *reconcileStackSession) ensureStack(ctx context.Context, workspace auto.Workspace) error {
 	var a auto.Stack
+	var err error
 
 	if sess.stack.UseLocalStackOnly {
 		sess.logger.Info("Using local stack", "stack", sess.stack.Stack)
-		a, err = auto.SelectStack(ctx, sess.stack.Stack, w)
+		a, err = auto.SelectStack(ctx, sess.stack.Stack, workspace)
 	} else {
-		sess.logger.Info("Upserting stack", "stack", sess.stack.Stack, "workspace", w)
-		a, err = auto.UpsertStack(ctx, sess.stack.Stack, w)
+		sess.logger.Info("Upserting stack", "stack", sess.stack.Stack, "workspace", workspace)
+		a, err = auto.UpsertStack(ctx, sess.stack.Stack, workspace)
 	}
 	if err != nil {
 		return errors.Wrapf(err, "failed to create and/or select stack: %s", sess.stack.Stack)
@@ -1131,7 +1012,7 @@ func (sess *reconcileStackSession) SetupWorkdirWithGitRepo(srcRepo *pulumiv1.Inl
 	sess.logger.Debug("Initial autostack config", "config", c)
 
 	// Ensure stack settings file in workspace is populated appropriately.
-	if err = sess.ensureStackSettings(context.Background(), w); err != nil {
+	if err = sess.ensureStackSettings(context.Background(), workspace); err != nil {
 		return err
 	}
 
